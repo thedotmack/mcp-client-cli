@@ -3,7 +3,7 @@
 import { Command } from 'commander';
 import { MCPClient } from '../client/MCPClient.js';
 import type { ServerConfig } from '../config/loader.js';
-import { loadConfig, getServerConfig } from '../config/loader.js';
+import { loadConfig, saveConfig } from '../config/loader.js';
 import { generateCommandOptions, executeToolCommand } from './generator.js';
 
 const program = new Command();
@@ -14,141 +14,250 @@ program
   .version('0.1.0');
 
 /**
- * Main CLI entry point
- * Dynamically discovers tools from MCP server and registers them as commands
+ * Register server tools as subcommands
  */
-async function main() {
-  const args = process.argv.slice(2);
-
-  // Handle help and version flags early
-  if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
-    program.outputHelp();
-    process.exit(0);
-  }
-
-  if (args[0] === '--version' || args[0] === '-V') {
-    console.log(program.version());
-    process.exit(0);
-  }
-
-  // Parse server specification
-  let serverConfig: ServerConfig | null = null;
-  let serverName: string | undefined;
-
-  // Check for --server flag (inline server specification)
-  const serverFlagIndex = args.indexOf('--server');
-  if (serverFlagIndex !== -1 && serverFlagIndex + 1 < args.length) {
-    const serverSpec = args[serverFlagIndex + 1];
-    const parts = serverSpec.split(/\s+/);
-    serverConfig = {
-      command: parts[0],
-      args: parts.slice(1)
-    };
-    // Remove --server and its value from args
-    args.splice(serverFlagIndex, 2);
-  }
-
-  // Check for --use flag (named server from config)
-  const useFlagIndex = args.indexOf('--use');
-  if (useFlagIndex !== -1 && useFlagIndex + 1 < args.length) {
-    serverName = args[useFlagIndex + 1];
-    const config = loadConfig();
-    serverConfig = getServerConfig(config, serverName);
-    if (!serverConfig) {
-      console.error(`Error: Server '${serverName}' not found in config`);
-      process.exit(1);
-    }
-    // Remove --use and its value from args
-    args.splice(useFlagIndex, 2);
-  }
-
-  // If no server specified, try default from config
-  if (!serverConfig) {
-    const config = loadConfig();
-    if (config) {
-      serverConfig = getServerConfig(config);
-    }
-
-    if (!serverConfig) {
-      console.error('Error: No MCP server specified. Use --server or --use flag, or configure a default server in ~/.mcp-cli.json');
-      process.exit(1);
-    }
-  }
-
-  // Check for special commands
-  if (args[0] === '--list-tools') {
-    await listTools(serverConfig);
-    return;
-  }
-
-  // Connect to MCP server
+async function registerServerTools(serverCmd: Command, serverName: string, serverConfig: ServerConfig) {
   const client = new MCPClient(serverConfig);
 
   try {
     await client.connect();
-
-    // Discover tools from the server
     const tools = await client.listTools();
 
     if (tools.length === 0) {
-      console.log('No tools available from this MCP server');
+      console.log(`No tools available from ${serverName}`);
       await client.disconnect();
-      process.exit(0);
+      return;
     }
 
-    // Register each tool as a command
+    // Register each tool as a subcommand
     for (const tool of tools) {
-      const cmd = program
+      const toolCmd = serverCmd
         .command(tool.name)
         .description(tool.description || `Execute ${tool.name}`);
 
-      // Generate options from tool schema
-      generateCommandOptions(tool, cmd);
+      generateCommandOptions(tool, toolCmd);
 
-      // Set action handler
-      cmd.action(async (options) => {
+      toolCmd.action(async (options) => {
         await executeToolCommand(client, tool.name, options);
         await client.disconnect();
       });
     }
 
-    // Parse and execute
-    await program.parseAsync(process.argv);
-
     await client.disconnect();
   } catch (error: any) {
-    console.error('Error:', error.message);
-    await client.disconnect();
+    console.error(`Error connecting to ${serverName}:`, error.message);
     process.exit(1);
   }
 }
 
 /**
- * List all available tools from the server
+ * Management commands
  */
-async function listTools(serverConfig: ServerConfig) {
-  const client = new MCPClient(serverConfig);
 
-  try {
-    await client.connect();
-    const tools = await client.listTools();
+// List all configured servers
+program
+  .command('list')
+  .description('List all configured MCP servers')
+  .action(() => {
+    const config = loadConfig();
+    if (!config || Object.keys(config.servers).length === 0) {
+      console.log('No MCP servers configured.');
+      return;
+    }
 
-    console.log(`Available tools (${tools.length}):\n`);
-
-    for (const tool of tools) {
-      console.log(`  ${tool.name}`);
-      if (tool.description) {
-        console.log(`    ${tool.description}`);
+    console.log('Configured MCP servers:\n');
+    for (const [name, serverConfig] of Object.entries(config.servers)) {
+      console.log(`  ${name}`);
+      if (serverConfig.description) {
+        console.log(`    ${serverConfig.description}`);
+      }
+      console.log(`    Command: ${serverConfig.command} ${(serverConfig.args || []).join(' ')}`);
+      if (serverConfig.env && Object.keys(serverConfig.env).length > 0) {
+        console.log(`    Environment: ${Object.keys(serverConfig.env).join(', ')}`);
       }
       console.log();
     }
+  });
 
-    await client.disconnect();
-  } catch (error: any) {
-    console.error('Error listing tools:', error.message);
-    await client.disconnect();
+// Get details for a specific server
+program
+  .command('get')
+  .argument('<name>', 'Server name')
+  .description('Get details for a specific MCP server')
+  .action((name: string) => {
+    const config = loadConfig();
+    if (!config || !config.servers[name]) {
+      console.error(`Server '${name}' not found.`);
+      process.exit(1);
+    }
+
+    const serverConfig = config.servers[name];
+    console.log(`Server: ${name}`);
+    if (serverConfig.description) {
+      console.log(`Description: ${serverConfig.description}`);
+    }
+    console.log(`Command: ${serverConfig.command}`);
+    if (serverConfig.args && serverConfig.args.length > 0) {
+      console.log(`Arguments: ${serverConfig.args.join(' ')}`);
+    }
+    if (serverConfig.env && Object.keys(serverConfig.env).length > 0) {
+      console.log('Environment variables:');
+      for (const [key, value] of Object.entries(serverConfig.env)) {
+        console.log(`  ${key}=${value}`);
+      }
+    }
+  });
+
+// Remove a server
+program
+  .command('remove')
+  .argument('<name>', 'Server name')
+  .description('Remove an MCP server configuration')
+  .action((name: string) => {
+    const config = loadConfig() || { servers: {} };
+
+    if (!config.servers[name]) {
+      console.error(`Server '${name}' not found.`);
+      process.exit(1);
+    }
+
+    delete config.servers[name];
+
+    // Remove default if it was the removed server
+    if (config.defaultServer === name) {
+      delete config.defaultServer;
+    }
+
+    saveConfig(config);
+    console.log(`Removed server '${name}'`);
+  });
+
+// Add a server
+program
+  .command('add')
+  .argument('<name>', 'Server name')
+  .option('--transport <type>', 'Transport type: stdio (default), sse, or http')
+  .option('--url <url>', 'URL for SSE or HTTP transport')
+  .option('--env <key=value>', 'Environment variable (can be specified multiple times)', (value, previous: Record<string, string> = {}) => {
+    const [key, val] = value.split('=');
+    previous[key] = val;
+    return previous;
+  })
+  .option('--header <header>', 'HTTP header (can be specified multiple times)', (value, previous: string[] = []) => {
+    previous.push(value);
+    return previous;
+  })
+  .option('--description <desc>', 'Server description')
+  .description('Add an MCP server configuration (use -- to separate server command from CLI options)')
+  .allowUnknownOption()
+  .action((name: string, options: any, command: Command) => {
+    const config = loadConfig() || { servers: {} };
+
+    if (config.servers[name]) {
+      console.error(`Server '${name}' already exists. Remove it first with 'mcp-cli remove ${name}'`);
+      process.exit(1);
+    }
+
+    // Get command args after the -- separator or after all options
+    const rawArgs = command.args.slice(1); // Skip the name argument
+
+    const transport = options.transport || 'stdio';
+    const serverConfig: ServerConfig = {
+      command: '',
+      args: []
+    };
+
+    if (transport === 'stdio') {
+      // Stdio transport: use command and args
+      if (!rawArgs || rawArgs.length === 0) {
+        console.error('Error: Command is required for stdio transport. Use -- to separate command: mcp-cli add <name> [options] -- <command>');
+        process.exit(1);
+      }
+
+      serverConfig.command = rawArgs[0];
+      serverConfig.args = rawArgs.slice(1);
+    } else if (transport === 'sse' || transport === 'http') {
+      // SSE/HTTP transport: use URL
+      if (!options.url) {
+        console.error(`Error: --url is required for ${transport} transport`);
+        process.exit(1);
+      }
+
+      serverConfig.command = transport;
+      serverConfig.args = [options.url];
+
+      if (options.header) {
+        serverConfig.env = serverConfig.env || {};
+        serverConfig.env['HEADERS'] = JSON.stringify(options.header);
+      }
+    }
+
+    if (options.env) {
+      serverConfig.env = { ...serverConfig.env, ...options.env };
+    }
+
+    if (options.description) {
+      serverConfig.description = options.description;
+    }
+
+    config.servers[name] = serverConfig;
+    saveConfig(config);
+
+    console.log(`Added server '${name}'`);
+    console.log(`  Command: ${serverConfig.command} ${(serverConfig.args || []).join(' ')}`);
+  });
+
+/**
+ * Main CLI entry point
+ */
+async function main() {
+  const args = process.argv.slice(2);
+
+  // Check if it's a management command
+  const managementCommands = ['list', 'get', 'remove', 'add'];
+  if (managementCommands.includes(args[0])) {
+    await program.parseAsync(process.argv);
+    return;
+  }
+
+  // Load configuration
+  const config = loadConfig();
+
+  if (!config || Object.keys(config.servers).length === 0) {
+    console.error('Error: No MCP servers configured. Use "mcp-cli add" to add a server.');
     process.exit(1);
   }
+
+  // If a server name is specified, connect to it and register tools
+  const serverName = args[0];
+  if (serverName && config.servers[serverName]) {
+    const serverCmd = program
+      .command(serverName)
+      .description(config.servers[serverName].description || `Access ${serverName} MCP server`);
+
+    // Eagerly load tools for this server
+    await registerServerTools(serverCmd, serverName, config.servers[serverName]);
+  } else {
+    // No specific server requested, register all servers as subcommands
+    for (const [name, serverConfig] of Object.entries(config.servers)) {
+      program
+        .command(name)
+        .description(serverConfig.description || `Access ${name} MCP server`)
+        .action(async () => {
+          console.log(`Use 'mcp-cli ${name} <tool>' to execute a tool`);
+          console.log(`Use 'mcp-cli ${name} --help' to see available tools`);
+        });
+    }
+  }
+
+  // Add help text for available servers
+  program.addHelpText('after', () => {
+    const serverList = Object.keys(config.servers).join(', ');
+    return `\nAvailable MCP Servers:\n  ${serverList}\n\nManagement Commands:\n  list      List all configured servers\n  get       Get server details\n  add       Add a new server\n  remove    Remove a server\n\nUse 'mcp-cli <server> --help' to see tools for a specific server.`;
+  });
+
+  // Parse command line
+  await program.parseAsync(process.argv);
 }
 
 // Run CLI
