@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "chroma": {
+      "command": "uvx",
+      "args": [
+        "chroma-mcp",
+        "--client-type", "persistent",
+        "--data-dir", "~/.chroma"
+      ],
+      "description": "ChromaDB vector database"
+    }
+  },
+  "defaultServer": "chroma"
+}
