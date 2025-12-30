@@ -5,8 +5,12 @@ import { MCPClient } from '../client/MCPClient.js';
 import type { ServerConfig } from '../config/loader.js';
 import { loadConfig, saveConfig } from '../config/loader.js';
 import { generateCommandOptions, executeToolCommand } from './generator.js';
+import { ToolCache } from '../client/ToolCache.js';
 
 const program = new Command();
+
+// 전역 캐시 인스턴스
+const toolCache = new ToolCache();
 
 program
   .name('mcp-cli')
@@ -17,19 +21,16 @@ program
  * Register server tools as subcommands
  */
 async function registerServerTools(serverCmd: Command, serverName: string, serverConfig: ServerConfig) {
-  const client = new MCPClient(serverConfig);
-
   try {
-    await client.connect();
-    const tools = await client.listTools();
+    // 캐시에서 도구 목록 가져옴 (연결 안 함!)
+    const tools = await toolCache.getOrFetch(serverName, serverConfig);
 
     if (tools.length === 0) {
       console.log(`No tools available from ${serverName}`);
-      await client.disconnect();
       return;
     }
 
-    // Register each tool as a subcommand
+    // 각 도구를 서브커맨드로 등록
     for (const tool of tools) {
       const toolCmd = serverCmd
         .command(tool.name)
@@ -38,14 +39,23 @@ async function registerServerTools(serverCmd: Command, serverName: string, serve
       generateCommandOptions(tool, toolCmd);
 
       toolCmd.action(async (options) => {
-        await executeToolCommand(client, tool.name, options);
-        await client.disconnect();
+        // 실행 시점에 새 클라이언트 생성 및 연결 ← Lazy Connect!
+        const client = new MCPClient(serverConfig);
+
+        try {
+          await client.connect();
+          await executeToolCommand(client, tool.name, options);
+          await client.disconnect();
+        } catch (error) {
+          await client.disconnect();
+          throw error;
+        }
       });
     }
 
-    await client.disconnect();
+    // disconnect() 제거! (더 이상 미리 연결 안 함)
   } catch (error: any) {
-    console.error(`Error connecting to ${serverName}:`, error.message);
+    console.error(`Error loading tools for ${serverName}:`, error.message);
     process.exit(1);
   }
 }
@@ -132,6 +142,31 @@ program
     console.log(`Removed server '${name}'`);
   });
 
+// Refresh tool cache for a server
+program
+  .command('refresh')
+  .argument('<name>', 'Server name')
+  .description('Refresh tool cache for a specific server')
+  .action((name: string) => {
+    const config = loadConfig();
+    if (!config || !config.servers[name]) {
+      console.error(`Server '${name}' not found.`);
+      process.exit(1);
+    }
+
+    toolCache.invalidate(name);
+    console.log(`Cache cleared for '${name}'. Tools will be fetched on next use.`);
+  });
+
+// Clear all tool caches
+program
+  .command('clear-cache')
+  .description('Clear all tool caches')
+  .action(() => {
+    toolCache.clear();
+    console.log('All tool caches cleared.');
+  });
+
 // Add a server
 program
   .command('add')
@@ -214,7 +249,7 @@ async function main() {
   const args = process.argv.slice(2);
 
   // Check if it's a management command
-  const managementCommands = ['list', 'get', 'remove', 'add'];
+  const managementCommands = ['list', 'get', 'remove', 'add', 'refresh', 'clear-cache'];
   if (managementCommands.includes(args[0])) {
     await program.parseAsync(process.argv);
     return;
@@ -253,7 +288,7 @@ async function main() {
   // Add help text for available servers
   program.addHelpText('after', () => {
     const serverList = Object.keys(config.servers).join(', ');
-    return `\nAvailable MCP Servers:\n  ${serverList}\n\nManagement Commands:\n  list      List all configured servers\n  get       Get server details\n  add       Add a new server\n  remove    Remove a server\n\nUse 'mcp-cli <server> --help' to see tools for a specific server.`;
+    return `\nAvailable MCP Servers:\n  ${serverList}\n\nManagement Commands:\n  list         List all configured servers\n  get          Get server details\n  add          Add a new server\n  remove       Remove a server\n  refresh      Refresh tool cache for a server\n  clear-cache  Clear all tool caches\n\nUse 'mcp-cli <server> --help' to see tools for a specific server.`;
   });
 
   // Parse command line
